@@ -1,9 +1,21 @@
 from pathlib import Path
+import os
+import re
 
+from dotenv import load_dotenv
+import google.generativeai as genai
 import pandas as pd
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+
+
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GEMMA_MODEL_NAME = "gemma-4-26b-a4b-it"
+
+if GOOGLE_API_KEY:
+	genai.configure(api_key=GOOGLE_API_KEY)
 
 
 DATA_DIR = Path("data/processed")
@@ -108,3 +120,89 @@ def predict_svm(patient_series, k):
 	prediction = model.predict(patient_array)[0]
 	confidence_pct = round(float(model.predict_proba(patient_array)[0].max()) * 100, 1)
 	return str(prediction), confidence_pct
+
+
+def _build_few_shot_prompt(patient_series, k, n_examples_per_class=2):
+	"""
+	Build a reproducible few-shot Gemma prompt using the SVM's top-k genes.
+
+	The labeled examples come only from the training split. Each expression
+	value is rounded to two decimal places so the prompt stays readable while
+	both models receive the same selected features.
+	"""
+	top_genes = GENE_RANKING[:k]
+	train_df = FULL_DF[FULL_DF["split"] == "train"]
+	all_examples = train_df[train_df["cancer"] == "ALL"].sample(
+		n=n_examples_per_class, random_state=42
+	)
+	aml_examples = train_df[train_df["cancer"] == "AML"].sample(
+		n=n_examples_per_class, random_state=42
+	)
+
+	def format_values(values):
+		return ", ".join(
+			f"{gene}={float(values[gene]):.2f}" for gene in top_genes
+		)
+
+	example_lines = []
+	for example_number, (_, patient) in enumerate(all_examples.iterrows(), start=1):
+		example_lines.append(
+			f"Example {example_number} (ALL): {format_values(patient)}"
+		)
+	for example_number, (_, patient) in enumerate(
+		aml_examples.iterrows(), start=n_examples_per_class + 1
+	):
+		example_lines.append(
+			f"Example {example_number} (AML): {format_values(patient)}"
+		)
+
+	return (
+		"You are a medical machine learning assistant classifying leukemia subtype "
+		"from gene expression data. Below are labeled example patients, each showing "
+		f"expression values for the same {k} genes. Learn the pattern from these "
+		"examples, then classify the new unlabeled patient.\n\n"
+		+ "\n".join(example_lines)
+		+ "\n\nNew patient (unlabeled): "
+		+ format_values(patient_series)
+		+ "\n\nRespond in EXACTLY this format and nothing else:\n"
+		"Diagnosis: <ALL or AML>\n"
+		"Confidence: <a number from 0 to 100>\n"
+		"Explanation: <one or two plain-language sentences a non-expert could "
+		"understand, comparing the new patient to the example patients>"
+	)
+
+
+def predict_gemma(patient_series, k):
+	"""
+	Classify a patient with Gemma using reproducible labeled examples.
+
+	Returns ``(label, confidence_pct, explanation)``. A ``RuntimeError`` is
+	raised for missing configuration, API failures, or an unparseable response.
+	"""
+	if not GOOGLE_API_KEY:
+		raise RuntimeError("GOOGLE_API_KEY is missing — add it to your .env file.")
+
+	prompt = _build_few_shot_prompt(patient_series, k)
+	try:
+		response = genai.GenerativeModel(GEMMA_MODEL_NAME).generate_content(prompt)
+		response_text = response.text
+	except Exception as error:
+		raise RuntimeError(f"Gemma API call failed: {error}") from error
+
+	diagnosis_match = re.search(r"Diagnosis:\s*(ALL|AML)", response_text, re.IGNORECASE)
+	confidence_match = re.search(
+		r"Confidence:\s*(\d+(?:\.\d+)?)", response_text, re.IGNORECASE
+	)
+	explanation_match = re.search(
+		r"Explanation:\s*(.+)", response_text, re.IGNORECASE | re.DOTALL
+	)
+	if not diagnosis_match or not confidence_match or not explanation_match:
+		raise RuntimeError(
+			f"Gemma response did not match the expected format. Raw response: {response_text}"
+		)
+
+	return (
+		diagnosis_match.group(1).upper(),
+		float(confidence_match.group(1)),
+		explanation_match.group(1).strip(),
+	)

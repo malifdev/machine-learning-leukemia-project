@@ -13,7 +13,6 @@ and backend logic are implemented.
 """
 
 import time
-import random
 import gradio as gr
 from src import pipeline
 
@@ -155,25 +154,37 @@ def run_prediction(file_obj, top_k, progress=gr.Progress()):
     progress(0.6, desc="Running SVM prediction...")
     svm_pred, svm_conf = pipeline.predict_svm(patient_series, top_k)
 
-    # TODO: replace with real Gemma few-shot call later
-    gemma_pred = random.choice(["ALL", "AML"])
-    gemma_conf = round(random.uniform(70, 95), 1)
+    progress(0.8, desc="Asking Gemma (few-shot)...")
+    try:
+        gemma_pred, gemma_conf, gemma_explanation = pipeline.predict_gemma(patient_series, top_k)
+        gemma_conf = round(gemma_conf, 1)
+    except Exception as error:
+        gemma_pred = "ERROR"
+        gemma_conf = 0.0
+        gemma_explanation = str(error)
 
     progress(1.0, desc="Comparing results...")
 
     svm_class = "all" if svm_pred == "ALL" else "aml"
-    gemma_class = "all" if gemma_pred == "ALL" else "aml"
+    gemma_class = "" if gemma_pred == "ERROR" else ("all" if gemma_pred == "ALL" else "aml")
 
-    agree = svm_pred == gemma_pred
-    verdict = (
-        f"✅ **Both models agree: {svm_pred}**\n\nSVM and Gemma reached the same conclusion "
-        f"using the top {top_k} selected genes, which increases confidence in this result."
-        if agree
-        else
-        f"⚠️ **Models disagree** — SVM says **{svm_pred}**, Gemma says **{gemma_pred}**.\n\n"
-        f"This can happen with a small training set (72 samples). Consider reviewing the "
-        f"top {top_k} selected genes or requesting a second opinion."
-    )
+    if gemma_pred == "ERROR":
+        verdict = (
+            f"⚠️ SVM predicted **{svm_pred}** with {svm_conf}% confidence. "
+            f"Gemma comparison unavailable: {gemma_explanation}"
+        )
+    else:
+        agree = svm_pred == gemma_pred
+        verdict = (
+            f"✅ **Both models agree: {svm_pred}**\n\nSVM and Gemma reached the same conclusion "
+            f"using the top {top_k} selected genes, which increases confidence in this result."
+            if agree
+            else
+            f"⚠️ **Models disagree** — SVM says **{svm_pred}**, Gemma says **{gemma_pred}**.\n\n"
+            f"This can happen with a small training set (72 samples). Consider reviewing the "
+            f"top {top_k} selected genes or requesting a second opinion."
+        )
+        verdict += f"\n\n**Gemma's reasoning:** {gemma_explanation}"
 
     return (
         gr.update(value=svm_pred, elem_classes=["pred-label", svm_class]),
